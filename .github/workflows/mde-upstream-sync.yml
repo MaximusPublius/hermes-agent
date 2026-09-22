@@ -28,8 +28,9 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      - name: Configure git
+      - name: Configure git and fetch upstream
         run: |
+          set -euo pipefail
           git config user.name "mde-upstream-sync"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
@@ -55,16 +56,13 @@ jobs:
 
       - name: Merge upstream into candidate
         if: steps.detect.outputs.changed == 'true'
-        id: merge
         shell: bash
         run: |
           set -euo pipefail
           if ! git merge --no-edit "upstream/${SYNC_BRANCH}"; then
             git merge --abort || true
-            echo "merge_conflict=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          echo "merge_conflict=false" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         if: steps.detect.outputs.changed == 'true'
@@ -83,7 +81,7 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run upstream compatibility tests before push
+      - name: Run compatibility tests before advancing fork main
         if: steps.detect.outputs.changed == 'true'
         shell: bash
         env:
@@ -101,7 +99,27 @@ jobs:
         run: |
           set -euo pipefail
           git push origin HEAD:main
+
+      - name: Mirror upstream tags after code is known-good
+        if: steps.detect.outputs.changed != 'true' || success()
+        shell: bash
+        run: |
+          set -euo pipefail
           git push origin --tags
+
+      - name: Close stale sync-blocked issue after success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="Hermes upstream sync blocked"
+          EXISTING="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Automated upstream sync is healthy again on run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            gh issue close "$EXISTING" --reason completed
+          fi
 
       - name: Record sync summary
         if: always()
@@ -133,7 +151,7 @@ jobs:
           Fork SHA before attempt: ${{ steps.detect.outputs.fork_sha || 'unknown' }}
           Upstream SHA: ${{ steps.detect.outputs.upstream_sha || 'unknown' }}
 
-          Fail closed: fork main was not intentionally advanced by this workflow after a failed merge/test. Inspect the failed step, resolve safely, rerun, and preserve MDE-only changes."
+          Fail closed: fork main was not advanced after a failed merge/test. Inspect the failed step, resolve safely, rerun, and preserve MDE-only changes."
 
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
