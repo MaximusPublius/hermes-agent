@@ -1,0 +1,160 @@
+name: MDE Sync Upstream
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: mde-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPO: NousResearch/hermes-agent
+      SYNC_BRANCH: main
+
+    steps:
+      - name: Checkout MDE fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure git and fetch upstream
+        run: |
+          set -euo pipefail
+          git config user.name "mde-upstream-sync"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${SYNC_BRANCH}" --tags
+
+      - name: Detect upstream changes
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="$(git rev-parse "upstream/${SYNC_BRANCH}")"
+          FORK_SHA="$(git rev-parse HEAD)"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "fork_sha=${FORK_SHA}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "upstream/${SYNC_BRANCH}" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream ${UPSTREAM_SHA}."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream changes detected: ${UPSTREAM_SHA}"
+          fi
+
+      - name: Merge upstream into candidate
+        if: steps.detect.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git merge --no-edit "upstream/${SYNC_BRANCH}"; then
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Install uv
+        if: steps.detect.outputs.changed == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        if: steps.detect.outputs.changed == 'true'
+        run: uv python install 3.11
+
+      - name: Install Hermes test dependencies
+        if: steps.detect.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run compatibility tests before advancing fork main
+        if: steps.detect.outputs.changed == 'true'
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+
+      - name: Push tested sync to fork main
+        if: steps.detect.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin HEAD:main
+
+      - name: Mirror upstream tags after code is known-good
+        if: steps.detect.outputs.changed != 'true' || success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin --tags
+
+      - name: Close stale sync-blocked issue after success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="Hermes upstream sync blocked"
+          EXISTING="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Automated upstream sync is healthy again on run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            gh issue close "$EXISTING" --reason completed
+          fi
+
+      - name: Record sync summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Hermes upstream sync"
+            echo
+            echo "- Fork before: \`${{ steps.detect.outputs.fork_sha || 'unknown' }}\`"
+            echo "- Upstream: \`${{ steps.detect.outputs.upstream_sha || 'unknown' }}\`"
+            echo "- Changes detected: \`${{ steps.detect.outputs.changed || 'unknown' }}\`"
+            echo "- Result: \`${{ job.status }}\`"
+            echo
+            echo "Production deployment is intentionally separate and must pass the MDE Compute canary/promotion path."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open one actionable issue when sync fails
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="Hermes upstream sync blocked"
+          EXISTING="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
+          BODY="Automated upstream sync failed.
+
+          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          Fork SHA before attempt: ${{ steps.detect.outputs.fork_sha || 'unknown' }}
+          Upstream SHA: ${{ steps.detect.outputs.upstream_sha || 'unknown' }}
+
+          Fail closed: fork main was not advanced after a failed merge/test. Inspect the failed step, resolve safely, rerun, and preserve MDE-only changes."
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
