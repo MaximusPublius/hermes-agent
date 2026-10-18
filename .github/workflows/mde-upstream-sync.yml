@@ -22,7 +22,7 @@ jobs:
       UPSTREAM_REPO: NousResearch/hermes-agent
       UPSTREAM_BRANCH: main
       CANDIDATE_BRANCH: mde/upstream-sync-candidate
-      REQUIRED_CHECK: Quality Gates
+      REQUIRED_CHECK: complete-matrix / Quality Gates
     steps:
       # This trusted workflow comes from fork main. Candidate code is never
       # executed in this write-scoped job, and no credential is persisted in

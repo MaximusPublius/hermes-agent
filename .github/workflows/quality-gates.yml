@@ -1,8 +1,7 @@
 name: Quality Gates
 
 on:
-  pull_request:
-  workflow_dispatch:
+  workflow_call:
 
 # Candidate code and candidate-controlled local actions receive no write
 # credential. The aggregate job below is the single promotion check.
@@ -11,7 +10,31 @@ permissions:
 
 jobs:
   python-tests:
-    uses: ./.github/workflows/tests.yml
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Install locked test dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --all-extras
+      - name: Run repository Python suite
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/ --ignore=tests/integration --ignore=tests/e2e --tb=short
   os-tests:
     uses: ./.github/workflows/tests-os.yml
     with:
