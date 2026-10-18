@@ -66,11 +66,34 @@ jobs:
   docker-lint:
     uses: ./.github/workflows/docker-lint.yml
   supply-chain:
-    uses: ./.github/workflows/supply-chain-audit.yml
-    with:
-      event_name: pull_request
-      scan: true
-      deps: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject high-risk supply-chain patterns and committed secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --diff-filter=d --name-only "$base...$head")"
+          if grep -E '\.pth$' <<<"$changed"; then
+            echo "::error::Python .pth file changed"
+            exit 1
+          fi
+          added="$(git diff --unified=0 "$base...$head" -- . ':!*.lock' ':!package-lock.json' | grep '^+' | grep -v '^+++' || true)"
+          if grep -Eiq '(base64\.(b64decode|decodebytes|urlsafe_b64decode).*(exec|eval)\(|(exec|eval)\(.*base64\.)' <<<"$added"; then
+            echo "::error::Encoded dynamic execution pattern detected"
+            exit 1
+          fi
+          if grep -Eiq '(AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9]{32,})' <<<"$added"; then
+            echo "::error::Potential committed credential detected"
+            exit 1
+          fi
 
   quality-gates:
     name: Quality Gates
