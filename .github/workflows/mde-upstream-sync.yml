@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
   issues: write
 
 concurrency:
@@ -14,111 +15,89 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  stage-or-promote:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     env:
       UPSTREAM_REPO: NousResearch/hermes-agent
-      SYNC_BRANCH: main
-
+      UPSTREAM_BRANCH: main
+      CANDIDATE_BRANCH: mde/upstream-sync-candidate
+      REQUIRED_CHECK: Quality Gates
     steps:
-      - name: Checkout MDE fork
-        uses: actions/checkout@v4
+      # This trusted workflow comes from fork main. Candidate code is never
+      # executed in this write-scoped job, and no credential is persisted in
+      # the checkout for a later command to discover.
+      - name: Checkout trusted fork main without persisted credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           ref: main
+          persist-credentials: false
 
-      - name: Configure git and fetch upstream
-        run: |
-          set -euo pipefail
-          git config user.name "mde-upstream-sync"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch upstream "${SYNC_BRANCH}" --tags
-
-      - name: Detect upstream changes
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          UPSTREAM_SHA="$(git rev-parse "upstream/${SYNC_BRANCH}")"
-          FORK_SHA="$(git rev-parse HEAD)"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-          echo "fork_sha=${FORK_SHA}" >> "$GITHUB_OUTPUT"
-
-          if git merge-base --is-ancestor "upstream/${SYNC_BRANCH}" HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork already contains upstream ${UPSTREAM_SHA}."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream changes detected: ${UPSTREAM_SHA}"
-          fi
-
-      - name: Merge upstream into candidate
-        if: steps.detect.outputs.changed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! git merge --no-edit "upstream/${SYNC_BRANCH}"; then
-            git merge --abort || true
-            exit 1
-          fi
-
-      - name: Install uv
-        if: steps.detect.outputs.changed == 'true'
-        uses: astral-sh/setup-uv@v5
-
-      - name: Set up Python 3.11
-        if: steps.detect.outputs.changed == 'true'
-        run: uv python install 3.11
-
-      - name: Install Hermes test dependencies
-        if: steps.detect.outputs.changed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv venv .venv --python 3.11
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
-
-      - name: Run compatibility tests before advancing fork main
-        if: steps.detect.outputs.changed == 'true'
-        shell: bash
-        env:
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
-        run: |
-          set -euo pipefail
-          source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
-
-      - name: Push tested sync to fork main
-        if: steps.detect.outputs.changed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git push origin HEAD:main
-
-      - name: Mirror upstream tags after code is known-good
-        if: steps.detect.outputs.changed != 'true' || success()
-        shell: bash
-        run: |
-          set -euo pipefail
-          git push origin --tags
-
-      - name: Close stale sync-blocked issue after success
-        if: success()
+      - name: Stage candidate or promote an independently certified candidate
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          TITLE="Hermes upstream sync blocked"
-          EXISTING="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "Automated upstream sync is healthy again on run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
-            gh issue close "$EXISTING" --reason completed
+          git config user.name "mde-upstream-sync"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Tags are intentionally excluded. A tag is never published merely
+          # because a different commit passed the candidate gate.
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${CANDIDATE_BRANCH}:refs/remotes/origin/${CANDIDATE_BRANCH}" || true
+
+          main_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          candidate_ref="refs/remotes/origin/${CANDIDATE_BRANCH}"
+
+          if git show-ref --verify --quiet "$candidate_ref"; then
+            candidate_sha="$(git rev-parse "$candidate_ref")"
+            if git merge-base --is-ancestor "$main_sha" "$candidate_sha" &&
+               git merge-base --is-ancestor "$upstream_sha" "$candidate_sha"; then
+              check_json="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${candidate_sha}/check-runs?per_page=100")"
+              latest_status="$(jq -r --arg name "$REQUIRED_CHECK" '[.check_runs[] | select(.name == $name and .app.slug == "github-actions")] | sort_by(.started_at) | last | .status // "missing"' <<<"$check_json")"
+              latest_conclusion="$(jq -r --arg name "$REQUIRED_CHECK" '[.check_runs[] | select(.name == $name and .app.slug == "github-actions")] | sort_by(.started_at) | last | .conclusion // "missing"' <<<"$check_json")"
+              if [ "$latest_status" = completed ] && [ "$latest_conclusion" = success ]; then
+                # Refuse races: the exact certified candidate must still be
+                # the remote candidate tip and fork main must still be the
+                # trusted commit used for the ancestry check.
+                git push \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                  "${candidate_sha}:refs/heads/main" \
+                  --force-with-lease="refs/heads/main:${main_sha}"
+                echo "Promoted exact candidate ${candidate_sha} after ${REQUIRED_CHECK} succeeded."
+                exit 0
+              fi
+              echo "Candidate ${candidate_sha} is awaiting a successful latest ${REQUIRED_CHECK} check."
+              exit 0
+            fi
+          fi
+
+          git switch --detach "$main_sha"
+          if ! git merge --no-edit "$upstream_sha"; then
+            git merge --abort || true
+            gh issue create \
+              --title "Hermes upstream sync blocked" \
+              --body "Upstream ${upstream_sha} does not merge cleanly into fork main ${main_sha}. No candidate was published."
+            exit 1
+          fi
+          candidate_sha="$(git rev-parse HEAD)"
+          git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "${candidate_sha}:refs/heads/${CANDIDATE_BRANCH}" \
+            --force-with-lease="refs/heads/${CANDIDATE_BRANCH}"
+
+          pr_number="$(gh pr list --head "$CANDIDATE_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr_number" ]; then
+            gh pr create \
+              --head "$CANDIDATE_BRANCH" \
+              --base main \
+              --title "chore: certify upstream ${upstream_sha}" \
+              --body "Automated staging only. Promotion remains blocked until the exact candidate SHA passes the complete repository Quality Gates workflow."
+          else
+            gh pr comment "$pr_number" --body "Staged exact candidate \`${candidate_sha}\` for fresh independent Quality Gates."
           fi
 
       - name: Record sync summary
@@ -128,33 +107,7 @@ jobs:
           {
             echo "### Hermes upstream sync"
             echo
-            echo "- Fork before: \`${{ steps.detect.outputs.fork_sha || 'unknown' }}\`"
-            echo "- Upstream: \`${{ steps.detect.outputs.upstream_sha || 'unknown' }}\`"
-            echo "- Changes detected: \`${{ steps.detect.outputs.changed || 'unknown' }}\`"
-            echo "- Result: \`${{ job.status }}\`"
-            echo
-            echo "Production deployment is intentionally separate and must pass the MDE Compute canary/promotion path."
+            echo "Candidate preparation and promotion are separate runs."
+            echo "No upstream tag is mirrored implicitly."
+            echo "Production deployment remains a separate MDE Compute canary/promotion path."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Open one actionable issue when sync fails
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TITLE="Hermes upstream sync blocked"
-          EXISTING="$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
-          BODY="Automated upstream sync failed.
-
-          Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          Fork SHA before attempt: ${{ steps.detect.outputs.fork_sha || 'unknown' }}
-          Upstream SHA: ${{ steps.detect.outputs.upstream_sha || 'unknown' }}
-
-          Fail closed: fork main was not advanced after a failed merge/test. Inspect the failed step, resolve safely, rerun, and preserve MDE-only changes."
-
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "$BODY"
-          else
-            gh issue create --title "$TITLE" --body "$BODY"
-          fi

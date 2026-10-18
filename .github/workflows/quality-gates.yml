@@ -1,0 +1,94 @@
+name: Quality Gates
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Candidate code and candidate-controlled local actions receive no write
+# credential. The aggregate job below is the single promotion check.
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    uses: ./.github/workflows/tests.yml
+  os-tests:
+    uses: ./.github/workflows/tests-os.yml
+    with:
+      desktop_updater: true
+  python-lints:
+    uses: ./.github/workflows/lint.yml
+    with:
+      event_name: pull_request
+  js-tests:
+    uses: ./.github/workflows/js-tests.yml
+  installer-tests:
+    uses: ./.github/workflows/installer-tests.yml
+  rust-tests:
+    uses: ./.github/workflows/rust-tests.yml
+  docs-site:
+    uses: ./.github/workflows/docs-site-checks.yml
+  history-check:
+    uses: ./.github/workflows/history-check.yml
+  contributor-check:
+    uses: ./.github/workflows/contributor-check.yml
+  uv-lockfile:
+    uses: ./.github/workflows/uv-lockfile-check.yml
+  infographic-check:
+    uses: ./.github/workflows/infographic-check.yml
+  profile-artifact-check:
+    uses: ./.github/workflows/profile-artifact-check.yml
+  case-collision-check:
+    uses: ./.github/workflows/case-collision-check.yml
+  docker-lint:
+    uses: ./.github/workflows/docker-lint.yml
+  supply-chain:
+    uses: ./.github/workflows/supply-chain-audit.yml
+    with:
+      event_name: pull_request
+      scan: true
+      deps: true
+
+  quality-gates:
+    name: Quality Gates
+    if: always()
+    needs:
+      - python-tests
+      - os-tests
+      - python-lints
+      - js-tests
+      - installer-tests
+      - rust-tests
+      - docs-site
+      - history-check
+      - contributor-check
+      - uv-lockfile
+      - infographic-check
+      - profile-artifact-check
+      - case-collision-check
+      - docker-lint
+      - supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every repository gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["RESULTS"])
+          failed = {
+              name: detail["result"]
+              for name, detail in results.items()
+              if detail["result"] != "success"
+          }
+          for name, detail in sorted(results.items()):
+              print(f"{name}: {detail['result']}")
+          if failed:
+              print(f"Blocking non-successful gates: {failed}", file=sys.stderr)
+              sys.exit(1)
+          PY
