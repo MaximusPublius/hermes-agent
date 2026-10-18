@@ -15,9 +15,11 @@ name: CI
 # main-only automation uses protected environments in its own workflows.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # The repository-scoped Quality Gates entry point owns PR execution.
+  # Keep this legacy orchestrator manually available during the transition;
+  # running both on one ref makes the reusable workflows' concurrency groups
+  # cancel one another and destroys exact-head gate evidence.
+  workflow_dispatch:
 
 permissions:
   contents: read
