@@ -1,0 +1,140 @@
+name: Quality Gates
+
+on:
+  workflow_call:
+
+# Candidate code and candidate-controlled local actions receive no write
+# credential. The aggregate job below is the single promotion check.
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Install locked test dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --all-extras
+      - name: Run repository Python suite
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/ --ignore=tests/integration --ignore=tests/e2e --tb=short
+  os-tests:
+    uses: ./.github/workflows/tests-os.yml
+    with:
+      desktop_updater: true
+  python-lints:
+    uses: ./.github/workflows/lint.yml
+    with:
+      event_name: pull_request
+  js-tests:
+    uses: ./.github/workflows/js-tests.yml
+  installer-tests:
+    uses: ./.github/workflows/installer-tests.yml
+  rust-tests:
+    uses: ./.github/workflows/rust-tests.yml
+  docs-site:
+    uses: ./.github/workflows/docs-site-checks.yml
+  history-check:
+    uses: ./.github/workflows/history-check.yml
+  contributor-check:
+    uses: ./.github/workflows/contributor-check.yml
+  uv-lockfile:
+    uses: ./.github/workflows/uv-lockfile-check.yml
+  infographic-check:
+    uses: ./.github/workflows/infographic-check.yml
+  profile-artifact-check:
+    uses: ./.github/workflows/profile-artifact-check.yml
+  case-collision-check:
+    uses: ./.github/workflows/case-collision-check.yml
+  docker-lint:
+    uses: ./.github/workflows/docker-lint.yml
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject high-risk supply-chain patterns and committed secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --diff-filter=d --name-only "$base...$head")"
+          if grep -E '\.pth$' <<<"$changed"; then
+            echo "::error::Python .pth file changed"
+            exit 1
+          fi
+          added="$(git diff --unified=0 "$base...$head" -- . ':!*.lock' ':!package-lock.json' | grep '^+' | grep -v '^+++' || true)"
+          if grep -Eiq '(base64\.(b64decode|decodebytes|urlsafe_b64decode).*(exec|eval)\(|(exec|eval)\(.*base64\.)' <<<"$added"; then
+            echo "::error::Encoded dynamic execution pattern detected"
+            exit 1
+          fi
+          if grep -Eiq '(AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9]{32,})' <<<"$added"; then
+            echo "::error::Potential committed credential detected"
+            exit 1
+          fi
+
+  quality-gates:
+    name: Quality Gates
+    if: always()
+    needs:
+      - python-tests
+      - os-tests
+      - python-lints
+      - js-tests
+      - installer-tests
+      - rust-tests
+      - docs-site
+      - history-check
+      - contributor-check
+      - uv-lockfile
+      - infographic-check
+      - profile-artifact-check
+      - case-collision-check
+      - docker-lint
+      - supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every repository gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["RESULTS"])
+          failed = {
+              name: detail["result"]
+              for name, detail in results.items()
+              if detail["result"] != "success"
+          }
+          for name, detail in sorted(results.items()):
+              print(f"{name}: {detail['result']}")
+          if failed:
+              print(f"Blocking non-successful gates: {failed}", file=sys.stderr)
+              sys.exit(1)
+          PY

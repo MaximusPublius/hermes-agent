@@ -1,0 +1,113 @@
+name: MDE Sync Upstream
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: mde-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  stage-or-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: NousResearch/hermes-agent
+      UPSTREAM_BRANCH: main
+      CANDIDATE_BRANCH: mde/upstream-sync-candidate
+      REQUIRED_CHECK: complete-matrix / Quality Gates
+    steps:
+      # This trusted workflow comes from fork main. Candidate code is never
+      # executed in this write-scoped job, and no credential is persisted in
+      # the checkout for a later command to discover.
+      - name: Checkout trusted fork main without persisted credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
+      - name: Stage candidate or promote an independently certified candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "mde-upstream-sync"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Tags are intentionally excluded. A tag is never published merely
+          # because a different commit passed the candidate gate.
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${CANDIDATE_BRANCH}:refs/remotes/origin/${CANDIDATE_BRANCH}" || true
+
+          main_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          candidate_ref="refs/remotes/origin/${CANDIDATE_BRANCH}"
+
+          if git show-ref --verify --quiet "$candidate_ref"; then
+            candidate_sha="$(git rev-parse "$candidate_ref")"
+            if git merge-base --is-ancestor "$main_sha" "$candidate_sha" &&
+               git merge-base --is-ancestor "$upstream_sha" "$candidate_sha"; then
+              check_json="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${candidate_sha}/check-runs?per_page=100")"
+              latest_status="$(jq -r --arg name "$REQUIRED_CHECK" '[.check_runs[] | select(.name == $name and .app.slug == "github-actions")] | sort_by(.started_at) | last | .status // "missing"' <<<"$check_json")"
+              latest_conclusion="$(jq -r --arg name "$REQUIRED_CHECK" '[.check_runs[] | select(.name == $name and .app.slug == "github-actions")] | sort_by(.started_at) | last | .conclusion // "missing"' <<<"$check_json")"
+              if [ "$latest_status" = completed ] && [ "$latest_conclusion" = success ]; then
+                # Refuse races: the exact certified candidate must still be
+                # the remote candidate tip and fork main must still be the
+                # trusted commit used for the ancestry check.
+                git push \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                  "${candidate_sha}:refs/heads/main" \
+                  --force-with-lease="refs/heads/main:${main_sha}"
+                echo "Promoted exact candidate ${candidate_sha} after ${REQUIRED_CHECK} succeeded."
+                exit 0
+              fi
+              echo "Candidate ${candidate_sha} is awaiting a successful latest ${REQUIRED_CHECK} check."
+              exit 0
+            fi
+          fi
+
+          git switch --detach "$main_sha"
+          if ! git merge --no-edit "$upstream_sha"; then
+            git merge --abort || true
+            gh issue create \
+              --title "Hermes upstream sync blocked" \
+              --body "Upstream ${upstream_sha} does not merge cleanly into fork main ${main_sha}. No candidate was published."
+            exit 1
+          fi
+          candidate_sha="$(git rev-parse HEAD)"
+          git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "${candidate_sha}:refs/heads/${CANDIDATE_BRANCH}" \
+            --force-with-lease="refs/heads/${CANDIDATE_BRANCH}"
+
+          pr_number="$(gh pr list --head "$CANDIDATE_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr_number" ]; then
+            gh pr create \
+              --head "$CANDIDATE_BRANCH" \
+              --base main \
+              --title "chore: certify upstream ${upstream_sha}" \
+              --body "Automated staging only. Promotion remains blocked until the exact candidate SHA passes the complete repository Quality Gates workflow."
+          else
+            gh pr comment "$pr_number" --body "Staged exact candidate \`${candidate_sha}\` for fresh independent Quality Gates."
+          fi
+
+      - name: Record sync summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Hermes upstream sync"
+            echo
+            echo "Candidate preparation and promotion are separate runs."
+            echo "No upstream tag is mirrored implicitly."
+            echo "Production deployment remains a separate MDE Compute canary/promotion path."
+          } >> "$GITHUB_STEP_SUMMARY"
